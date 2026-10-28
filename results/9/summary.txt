@@ -1,0 +1,9 @@
+===========================================================================
+SUMMARY
+===========================================================================
+Total                : 15,000
+First-order          : 3 (Manually verified to be false)
+Second-order         : 10,117
+Unclear              : 4,880
+Above search limit   : 0
+Errors               : 0

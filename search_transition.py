@@ -1,15 +1,32 @@
-"""Randomly search periodic degree patterns for numerical phase transitions.
+"""Search periodic hard-core tree recursions for bifurcations without parity-based labels.
 
-For f_d(r) = lambda / (1+r)^d, compose the maps in the order given
-by a degree pattern. Odd primitive periods: test period doubling of F.
-Even primitive periods: test for a saddle-node of F.
+For a primitive degree pattern p=(d1,...,dk), put
+    F_p(r) = f_d1 o f_d2 o ... o f_dk (r),
+    f_d(r) = lambda/(1+r)^d.
+The ONLY parity-based rule is construction of the increasing map g:
+    k even: g = F_p,
+    k odd:  g = F_p o F_p.
 
-Requires: numpy, scipy, joblib
+All patterns use the SAME critical point equations:
+    g_lambda(r*)=r*,  dg/dr(lambda,r*)=1.
+Classify candidate bifurcations by their derivatives:
+    saddle-node: d2g/dr2 != 0, dg/dlambda != 0
+    pitchfork:   d2g/dr2  = 0, d3g/dr3 != 0,
+                 dg/dlambda = 0, d2g/(dr dlambda) != 0.
+
+All searches use one fixed logarithmic scan from LAMBDA_MIN to LAMBDA_MAX;
+there is no adaptive expansion of the lambda range.
+
+The numerical classes are *bifurcation candidates*, not rigorous proofs of
+thermodynamic first/second-order phase transitions. An unsuccessful scan or a
+degenerate/poorly resolved point stays inconclusive.
+
+Requires: numpy, scipy, joblib. Example: python search_transition_unbiased.py
 """
 
 import os
-for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ[name] = "1"
+for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ[_key] = "1"
 
 import csv
 import time
@@ -17,357 +34,361 @@ import numpy as np
 from scipy.optimize import brentq, least_squares
 from joblib import Parallel, delayed, parallel_config
 
-# -------------------------- Settings --------------------------
-PERIOD_LENGTH = 10
+# ------------------------ User settings ------------------------
+PERIOD_LENGTH = 10           # Change to 10, etc.
 N_SAMPLES = 15_000
 DEGREE_MIN, DEGREE_MAX = 2, 100
 SEED = 1234
-N_JOBS = -1  # all available CPUs
+N_JOBS = -1
 
 LAMBDA_MIN = 1e-10
-INITIAL_LAMBDA_MAX = 1000.0
-MAX_LAMBDA = 1e30
-EXPANSION_FACTOR = 10.0
-SCAN_POINTS = 200
-R_GRID_SIZE = 1200
-JUMP_TOLERANCE = 1e-3
-EXPONENT_TOLERANCE = 0.1
+LAMBDA_MAX = 1000.0      # Fixed upper bound; change this as needed.
+SCAN_POINTS = 160         # Log-spaced lambda values across the full interval.
+R_GRID_SIZE = 700
+
+# Dimensionless derivative tolerances; use same thresholds for all periods.
+CURVATURE_TOL = 2e-4
+CUBIC_TOL = 1e-5
+PARAMETER_TOL = 2e-4
+MIXED_TOL = 1e-5
+SOLVER_TOL = 1e-10
 
 OUTPUT_FILE = "transition_results.csv"
 INTERESTING_FILE = "interesting_patterns.csv"
 
 
-# ----------------------- Basic functions ----------------------
+# ---------------------- Composition ---------------------------
 def minimal_period(pattern):
-    """Turn (2, 3, 2, 3) into (2, 3)."""
     pattern = tuple(map(int, pattern))
     if not pattern or min(pattern) <= 0:
-        raise ValueError("Degree patterns must contain positive integers.")
-    for k in range(1, len(pattern) + 1):
-        if len(pattern) % k == 0 and pattern[:k] * (len(pattern) // k) == pattern:
-            return pattern[:k]
+        raise ValueError("Degree patterns must contain positive integers")
+    for length in range(1, len(pattern) + 1):
+        if len(pattern) % length == 0 and pattern[:length] * (len(pattern)//length) == pattern:
+            return pattern[:length]
+    raise RuntimeError("Could not find primitive period")
+
+
+def increasing_pattern(primitive):
+    """The only parity-dependent choice: square an odd-length composition."""
+    return primitive if len(primitive) % 2 == 0 else primitive + primitive
+
+
+def g_eval(degrees, lam, r, derivatives=0):
+    """Compute g, g', g'', g''' analytically by repeated chain rule.
+
+    `degrees` is already the increasing composition (not the primitive one).
+    Works on scalars and NumPy arrays; derivatives=0/1/2/3.
+    """
+    y = np.asarray(r, dtype=float)
+    if derivatives >= 1:
+        p = np.ones_like(y)
+    if derivatives >= 2:
+        q = np.zeros_like(y)
+    if derivatives >= 3:
+        t = np.zeros_like(y)
+
+    with np.errstate(over='ignore', under='ignore', invalid='ignore', divide='ignore'):
+        for degree in reversed(degrees):
+            inv = 1.0 / (1.0 + y)
+            next_y = np.exp(np.log(lam) - degree * np.log1p(y))
+            if derivatives >= 1:
+                f1 = -degree * next_y * inv
+            if derivatives >= 2:
+                f2 = degree * (degree + 1) * next_y * inv**2
+            if derivatives >= 3:
+                f3 = -degree * (degree + 1) * (degree + 2) * next_y * inv**3
+                next_t = f3*p**3 + 3.0*f2*p*q + f1*t
+            if derivatives >= 2:
+                next_q = f2*p**2 + f1*q
+            if derivatives >= 1:
+                next_p = f1*p
+            y = next_y
+            if derivatives >= 1:
+                p = next_p
+            if derivatives >= 2:
+                q = next_q
+            if derivatives >= 3:
+                t = next_t
+
+    if derivatives == 0:
+        return y
+    if derivatives == 1:
+        return y, p
+    if derivatives == 2:
+        return y, p, q
+    return y, p, q, t
 
 
 def occupation(r):
-    return r / (1 + r)
+    return r/(1.0+r)
 
 
-def map_and_slope(pattern, lam, r):
-    """Compute F(r) and F'(r), using logarithms to avoid huge powers."""
-    y = np.asarray(r, dtype=float)
-    slope = np.ones_like(y)
-    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        for degree in reversed(pattern):
-            next_y = np.exp(np.log(lam) - degree * np.log1p(y))
-            slope *= -degree * next_y / (1 + y)
-            y = next_y
-    return y, slope
+# ---------------- Find fixed point branches --------------------
+def fixed_points(degrees, lam):
+    """Sign-changing roots of g(r)-r in [0,lambda]. Tangencies are refined later.
+
+    Use a linear + logarithmic grid in r/lambda, to resolve small ratios.
+    """
+    linear = np.linspace(0.0, 1.0, R_GRID_SIZE)
+    log_part = np.geomspace(1e-100, 1.0, max(400, R_GRID_SIZE))
+    x_grid = np.unique(np.r_[linear, log_part])
+    h = g_eval(degrees, lam, lam*x_grid)/lam - x_grid
+    finite = np.isfinite(h)
+    crossing = np.flatnonzero(finite[:-1] & finite[1:] & (h[:-1]*h[1:] < 0))
+
+    def h_scalar(x):
+        return float(g_eval(degrees, lam, lam*x)/lam - x)
+
+    roots = []
+    for i in crossing:
+        root_x = brentq(h_scalar, x_grid[i], x_grid[i+1], xtol=1e-300, rtol=1e-12)
+        root = lam*root_x
+        if not roots or abs(root-roots[-1]) > 1e-8*max(abs(root),abs(roots[-1]),1e-100):
+            roots.append(root)
+    return roots
 
 
-def F(pattern, lam, r):
-    return map_and_slope(pattern, lam, r)[0]
+def find_three_roots(degrees):
+    """Scan only [LAMBDA_MIN, LAMBDA_MAX] for three fixed points of g.
 
-
-def dF(pattern, lam, r):
-    return map_and_slope(pattern, lam, r)[1]
-
-
-def fixed_points(pattern, lam, grid_size=R_GRID_SIZE):
-    """Find roots of F(r) = r detected by sign changes on a grid."""
-    linear = np.linspace(0, lam, grid_size)
-    log_grid = np.geomspace(max(lam * 1e-12, 1e-15), lam, max(150, grid_size // 2))
-    grid = np.unique(np.r_[linear, log_grid])
-    values = F(pattern, lam, grid) - grid
-    with np.errstate(invalid="ignore", over="ignore"):
-        crossings = np.flatnonzero(values[:-1] * values[1:] < 0)
-    roots = sorted(brentq(lambda r: float(F(pattern, lam, r) - r),
-                          grid[i], grid[i + 1], xtol=1e-12, rtol=1e-12)
-                   for i in crossings)
-    unique = []
-    for root in roots:
-        if not unique or root - unique[-1] > 1e-8 * max(1, lam):
-            unique.append(root)
-    return unique
-
-
-def lambda_windows():
-    """Scan 1e-10..100, then 100..1000, etc. up to MAX_LAMBDA."""
-    low = LAMBDA_MIN
-    high = min(INITIAL_LAMBDA_MAX, MAX_LAMBDA)
-    while low < high:
-        yield np.geomspace(low, high, SCAN_POINTS), high
-        low, high = high, min(high * EXPANSION_FACTOR, MAX_LAMBDA)
-
-
-# --------------------- Odd-period case ------------------------
-def odd_fixed_point(pattern, lam):
-    """Odd compositions are decreasing, so their fixed point is unique."""
-    return brentq(lambda r: float(F(pattern, lam, r) - r),
-                  0, lam, xtol=1e-13, rtol=1e-13)
-
-
-def odd_critical_point(pattern):
-    """Find F(r_c) = r_c and F'(r_c) = -1."""
-    def condition(lam):
-        return float(dF(pattern, lam, odd_fixed_point(pattern, lam)) + 1)
-
-    for lambdas, search_max in lambda_windows():
-        values = [condition(lam) for lam in lambdas]
-        for i in range(len(lambdas) - 1):
-            if abs(values[i]) < 1e-14:
-                critical = float(lambdas[i])
-            elif values[i] * values[i + 1] < 0:
-                critical = brentq(condition, lambdas[i], lambdas[i + 1],
-                                  xtol=1e-13, rtol=1e-13)
-            else:
-                continue
-            return critical, odd_fixed_point(pattern, critical), search_max
+    The same fixed logarithmic lambda grid is used for every pattern.
+    """
+    for lam in np.geomspace(LAMBDA_MIN, LAMBDA_MAX, SCAN_POINTS):
+        roots = fixed_points(degrees, float(lam))
+        if len(roots) >= 3:
+            return float(lam), roots
     return None
 
 
-def two_cycle_branches(pattern, lam):
-    """Return lower and upper nontrivial roots of F(F(r)) = r."""
-    middle = odd_fixed_point(pattern, lam)
-    g = lambda r: float(F(pattern, lam, F(pattern, lam, r)) - r)
-    offsets = max(1.0, middle) * np.geomspace(1e-7, 0.9, 140)
-    left = right = None
+def refine_critical(degrees, lam_hit, roots):
+    """Find tangency g(r)=r, g'(r)=1, seeding from neighboring roots."""
+    candidates = []
+    for j in range(len(roots)-1):
+        # Close roots signal a nearby saddle-node; also works for pitchfork.
+        candidates.append(np.sqrt(roots[j]*roots[j+1]))
+    candidates += list(roots[1:-1])
+    candidates = list(dict.fromkeys(float(r) for r in candidates if 0 < r < lam_hit))
 
-    for offset in offsets:
-        x = middle - offset
-        if x <= 0:
-            break
-        if g(x) < -1e-13:
-            left = x
-            break
-    for offset in offsets:
-        x = middle + offset
-        if x >= lam:
-            break
-        if g(x) > 1e-13:
-            right = x
-            break
+    def equations(z):
+        lam, r = np.exp(z)
+        value, slope = g_eval(degrees, lam, r, derivatives=1)
+        return [float((value-r)/max(r, 1e-300)), float(slope-1.0)]
 
-    if left is None or right is None or g(0) * g(left) >= 0 or g(right) * g(lam) >= 0:
-        return None
-    lower = brentq(g, 0, left, xtol=1e-13, rtol=1e-13)
-    upper = brentq(g, right, lam, xtol=1e-13, rtol=1e-13)
-    return lower, upper
-
-
-def odd_pitchfork_test(pattern, critical, r_c):
-    """Check gap ~ epsilon^1/2 with negligible intercept near lambda_c."""
-    eps_values = (1e-2, 5e-3, 2e-3, 1e-3, 5e-4, 2e-4, 1e-4,
-                  5e-5, 2e-5, 1e-5, 5e-6, 2e-6, 1e-6)
-    measurements = []
-    for eps in eps_values:
-        branches = two_cycle_branches(pattern, critical * (1 + eps))
-        if branches is not None:
-            lower, upper = branches
-            gap = occupation(upper) - occupation(lower)
-            if np.isfinite(gap) and gap > 0:
-                measurements.append((eps, gap))
-
-    if len(measurements) < 5:
-        return False, None, None
-
-    # Fit using the closest half of the available observations.
-    points = np.array(sorted(measurements)[:max(5, len(measurements) // 2)])
-    eps, gaps = points[:, 0], points[:, 1]
-    _, jump = np.polyfit(np.sqrt(eps), gaps, 1)
-    beta, _ = np.polyfit(np.log(eps), np.log(gaps), 1)
-
-    below = critical * (1 - 1e-4)
-    above = critical * (1 + 1e-4)
-    crosses = (dF(pattern, below, odd_fixed_point(pattern, below)) > -1
-               and dF(pattern, above, odd_fixed_point(pattern, above)) < -1)
-    is_second_order = (abs(jump) < JUMP_TOLERANCE
-                       and abs(beta - 0.5) < EXPONENT_TOLERANCE and crosses)
-    return bool(is_second_order), float(jump), float(beta)
-
-
-# --------------------- Even-period case -----------------------
-def even_critical_point(pattern):
-    """Find the saddle-node F(r_c)=r_c, F'(r_c)=1."""
-    guess = None
-    for lambdas, search_max in lambda_windows():
-        for lam in lambdas:
-            roots = fixed_points(pattern, lam)
-            if len(roots) >= 3:
-                i = int(np.argmin(np.diff(roots)))
-                guess = (float(lam), (roots[i] + roots[i + 1]) / 2)
+    best = None
+    for r_init in candidates:
+        sol = least_squares(
+            equations, x0=np.log([lam_hit, r_init]),
+            bounds=(np.log([LAMBDA_MIN, 1e-300]), np.log([LAMBDA_MAX, LAMBDA_MAX])),
+            max_nfev=300, xtol=1e-13, ftol=1e-13, gtol=1e-13,
+        )
+        lam, r = np.exp(sol.x)
+        resid = float(np.linalg.norm(sol.fun))
+        if np.isfinite(resid) and 0 < r < lam and LAMBDA_MIN <= lam <= min(LAMBDA_MAX, lam_hit*(1+1e-5)):
+            if best is None or resid < best[2]:
+                best = (float(lam), float(r), resid)
+            if resid < 1e-10:
                 break
-        if guess is not None:
-            break
-    if guess is None:
+    if best is None:
         return None
 
-    def equations(log_coords):
-        lam, r = np.exp(log_coords)
-        value, slope = map_and_slope(pattern, lam, r)
-        return [(float(value) - r) / max(1, r), float(slope) - 1]
+    # A pitchfork is degenerate for the two-equation tangency solver:
+    # g-r and g'-1 can be tiny slightly away from the true critical point.
+    # Try the additional equation r*g''=0 *only* when the numerically found
+    # point is near-degenerate. The same check is applied to every pattern,
+    # without inspecting period parity. Adopt this refinement only if ALL
+    # three residuals become tiny; do not force saddle-nodes into pitchforks.
+    lam0, r0, _ = best
+    v, slope, curvature = g_eval(degrees, lam0, r0, derivatives=2)
+    if np.isfinite(curvature) and (abs(r0*curvature) < 0.05 or best[2] > 1e-11):
+        def triple_equations(z):
+            lam, r = np.exp(z)
+            v, p, q = g_eval(degrees, lam, r, derivatives=2)
+            return [(float(v)-r)/max(r, 1e-300), float(p)-1.0, float(r*q)]
 
-    solution = least_squares(
-        equations, np.log(guess),
-        bounds=(np.log([max(LAMBDA_MIN, 1e-15), 1e-15]),
-                np.log([MAX_LAMBDA, MAX_LAMBDA])),
-        xtol=1e-14, ftol=1e-14, gtol=1e-14, max_nfev=1000)
-    if not solution.success or np.linalg.norm(solution.fun) > 1e-8:
+        refined = least_squares(triple_equations, np.log([lam0, r0]),
+                                max_nfev=500, xtol=1e-13, ftol=1e-13, gtol=1e-13)
+        lam, r = np.exp(refined.x)
+        resid = float(np.linalg.norm(refined.fun))
+        if (np.isfinite(resid) and resid < 1e-9
+                and LAMBDA_MIN <= lam <= min(LAMBDA_MAX, lam_hit*(1+1e-5)) and 0 < r < lam):
+            return float(lam), float(r), resid
+
+    return best if best[2] <= SOLVER_TOL else None
+
+
+# ------------------ Uniform classification --------------------
+def classify_bifurcation(degrees, critical, r_c):
+    """Apply exactly the same second/third-derivative tests to every pattern."""
+    g, first, second, third = g_eval(degrees, critical, r_c, derivatives=3)
+    # Scale by r_c so units are comparable across very different lambda values.
+    curvature = float(r_c*second)
+    cubic = float(r_c*r_c*third)
+
+    # Parameter derivatives are taken at fixed r, not along the fixed-point branch.
+    eps = 2e-5
+    gp, dp = g_eval(degrees, critical*(1+eps), r_c, derivatives=1)
+    gm, dm = g_eval(degrees, critical*(1-eps), r_c, derivatives=1)
+    partial_lambda = float((gp-gm)/(2*eps*max(r_c, 1e-300)))  # lambda*g_lambda/r_c
+    mixed = float((dp-dm)/(2*eps))                             # lambda*g_{r lambda}
+
+    details = dict(second_derivative=float(second), third_derivative=float(third),
+                   scaled_curvature=curvature, scaled_cubic=cubic,
+                   scaled_parameter_derivative=partial_lambda,
+                   scaled_mixed_derivative=mixed)
+    if not all(np.isfinite(v) for v in details.values()):
+        return "unclear", details
+
+    # For saddle-node candidates, the independent derivative is nonzero.
+    if abs(curvature) > CURVATURE_TOL and abs(partial_lambda) > PARAMETER_TOL:
+        return "first-order", details
+
+    # For pitchfork candidates, g''=0 is not sufficient by itself.
+    if (abs(curvature) <= CURVATURE_TOL and abs(cubic) > CUBIC_TOL
+            and abs(partial_lambda) <= PARAMETER_TOL
+            and abs(mixed) > MIXED_TOL):
+        return "second-order", details
+
+    return "unclear", details
+
+
+def candidate_jump(degrees, critical, r_c, kind):
+    if kind == "second-order":
+        return 0.0  # pitchfork branches meet continuously at criticality
+    if kind != "first-order":
         return None
-    critical, saddle = np.exp(solution.x)
-    return float(critical), float(saddle), search_max
+    # Estimate the jump using the UNIQUE surviving fixed point just BELOW
+    # the bifurcation. Solving exactly at a saddle-node is fragile because a
+    # double root can look like two sign-changing roots under roundoff.
+    lam_below = critical*(1.0-1e-5)
+    if lam_below <= 0:
+        return None
+    try:
+        x = brentq(lambda z: float(g_eval(degrees, lam_below, lam_below*z)/lam_below-z),
+                   0.0, 1.0, xtol=1e-300, rtol=1e-12)
+        return float(abs(occupation(lam_below*x)-occupation(r_c)))
+    except (ValueError, OverflowError):
+        return None
 
 
-def even_jump(pattern, critical, saddle):
-    """Compare occupation at saddle-node and surviving fixed point."""
-    surviving = brentq(lambda r: float(F(pattern, critical, r) - r),
-                       0, critical, xtol=1e-12, rtol=1e-12)
-    return float(abs(occupation(surviving) - occupation(saddle)))
-
-
-# --------------------- Pattern analysis -----------------------
 def analyze_one(pattern):
     original = tuple(map(int, pattern))
-    pattern = minimal_period(original)
-    result = dict(input_pattern=original, primitive_pattern=pattern,
-                  period=len(pattern), status="ok", transition="unclear",
-                  order=None, critical_lambda=None, critical_occupation_jump=None,
-                  scaling_exponent=None, pitchfork_like=None,
-                  search_max_used=None, search_limit=None, error=None)
+    primitive = minimal_period(original)
+    degrees = increasing_pattern(primitive)
+    row = dict(input_pattern=original, primitive_pattern=primitive,
+               primitive_length=len(primitive), composition_length=len(degrees),
+               status="ok", transition="unclear", order=None, critical_lambda=None,
+               critical_ratio=None, critical_occupation_jump=None,
+               second_derivative=None, third_derivative=None,
+               scaled_curvature=None, scaled_cubic=None,
+               scaled_parameter_derivative=None, scaled_mixed_derivative=None,
+               solver_residual=None, detected_at_lambda=None,
+               search_limit=None, error=None)
     try:
-        if len(pattern) % 2:
-            found = odd_critical_point(pattern)
-            if found:
-                critical, r_c, search_max = found
-                is_second, jump, beta = odd_pitchfork_test(pattern, critical, r_c)
-                result.update(critical_lambda=critical, search_max_used=search_max,
-                              critical_occupation_jump=jump, scaling_exponent=beta,
-                              pitchfork_like=is_second,
-                              transition="second-order" if is_second else "unclear",
-                              order=2 if is_second else None)
-        else:
-            found = even_critical_point(pattern)
-            if found:
-                critical, saddle, search_max = found
-                jump = even_jump(pattern, critical, saddle)
-                is_first = jump > JUMP_TOLERANCE
-                result.update(critical_lambda=critical, search_max_used=search_max,
-                              critical_occupation_jump=jump,
-                              transition="first-order" if is_first else "continuous / unclear",
-                              order=1 if is_first else None)
-
-        if found is None:
-            result.update(status="above-search-limit", transition="above-search-limit",
-                          search_limit=MAX_LAMBDA)
+        scan = find_three_roots(degrees)
+        if scan is None:
+            row.update(status="above-search-limit", transition="above-search-limit",
+                       search_limit=LAMBDA_MAX)
+            return row
+        lam_hit, roots = scan
+        row.update(detected_at_lambda=lam_hit)
+        critical = refine_critical(degrees, lam_hit, roots)
+        if critical is None:
+            row.update(status="unresolved-critical", transition="unclear")
+            return row
+        lam_c, r_c, residual = critical
+        kind, details = classify_bifurcation(degrees, lam_c, r_c)
+        row.update(critical_lambda=lam_c, critical_ratio=r_c,
+                   solver_residual=residual, transition=kind,
+                   order={"first-order":1, "second-order":2}.get(kind),
+                   critical_occupation_jump=candidate_jump(degrees,lam_c,r_c,kind),
+                   **details)
     except Exception as exc:
-        result.update(status="error", transition="error", error=repr(exc))
-    return result
+        row.update(status="error", transition="error", error=repr(exc))
+    return row
 
 
+# --------------------- Sample and outputs ---------------------
 def random_patterns():
-    """Generate distinct patterns of the requested primitive period."""
     if PERIOD_LENGTH < 1 or N_SAMPLES < 1 or DEGREE_MIN < 1 or DEGREE_MAX < DEGREE_MIN:
-        raise ValueError("Invalid pattern sampling settings.")
+        raise ValueError("Invalid search settings")
+    if not (0 < LAMBDA_MIN < LAMBDA_MAX) or SCAN_POINTS < 2:
+        raise ValueError("Need 0 < LAMBDA_MIN < LAMBDA_MAX and SCAN_POINTS >= 2")
     rng = np.random.default_rng(SEED)
     patterns = set()
     attempts = 0
     while len(patterns) < N_SAMPLES:
         attempts += 1
-        if attempts > max(100_000, 100 * N_SAMPLES):
-            raise RuntimeError("Could not generate enough distinct primitive patterns.")
-        pattern = tuple(map(int, rng.integers(DEGREE_MIN, DEGREE_MAX + 1,
-                                               size=PERIOD_LENGTH)))
-        if len(minimal_period(pattern)) == PERIOD_LENGTH:
-            patterns.add(pattern)
+        if attempts > max(100_000, 100*N_SAMPLES):
+            raise RuntimeError("Could not generate enough distinct primitive patterns")
+        p = tuple(map(int, rng.integers(DEGREE_MIN, DEGREE_MAX+1, size=PERIOD_LENGTH)))
+        if len(minimal_period(p)) == PERIOD_LENGTH:
+            patterns.add(p)
     return sorted(patterns)
 
 
-FIELDS = ("input_pattern", "primitive_pattern", "period", "status", "transition",
-          "order", "critical_lambda", "search_max_used", "search_limit",
-          "critical_occupation_jump", "scaling_exponent", "pitchfork_like", "error")
+FIELDS = ("input_pattern", "primitive_pattern", "primitive_length", "composition_length",
+          "status", "transition", "order", "critical_lambda", "critical_ratio",
+          "critical_occupation_jump", "second_derivative", "third_derivative",
+          "scaled_curvature", "scaled_cubic", "scaled_parameter_derivative",
+          "scaled_mixed_derivative", "solver_residual", "detected_at_lambda",
+          "search_limit", "error")
 
 
 def save_csv(filename, results):
-    with open(filename, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=FIELDS)
+    with open(filename, "w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(results)
 
 
 def print_summary(results, elapsed):
-    """Print counts, performance, and first-order occupation-jump statistics."""
-    counts = {name: sum(r["transition"] == name for r in results)
-              for name in ("first-order", "second-order", "unclear",
-                           "continuous / unclear", "above-search-limit", "error")}
+    from collections import Counter
+    counts = Counter(row["transition"] for row in results)
     total = len(results)
-    throughput = total / elapsed if elapsed > 0 else 0
-
-    print("\n" + "=" * 75)
-    print("SUMMARY")
-    print("=" * 75)
-    for label, value in (
-        ("Total", total),
-        ("First-order", counts["first-order"]),
-        ("Second-order", counts["second-order"]),
-        ("Unclear", counts["unclear"] + counts["continuous / unclear"]),
-        ("Above search limit", counts["above-search-limit"]),
-        ("Errors", counts["error"]),
-    ):
+    throughput = total/elapsed if elapsed > 0 else 0
+    print("\n" + "="*75 + "\nSUMMARY\n" + "="*75)
+    for label, value in (("Total", total), ("First-order", counts["first-order"]),
+                         ("Second-order", counts["second-order"]),
+                         ("Unclear", counts["unclear"]),
+                         ("Above search limit", counts["above-search-limit"]),
+                         ("Errors", counts["error"])):
         print(f"{label:<21}: {value:,}")
-
-    print()
-    for label, value in (
-        ("Runtime", f"{elapsed:.2f} sec"),
-        ("Runtime", f"{elapsed / 60:.2f} min"),
-        ("Runtime", f"{elapsed / 3600:.3f} hr"),
-        ("Throughput", f"{throughput:.3f} patterns/sec"),
-        ("Est. 100k", f"{100_000 / throughput / 60:.2f} min" if throughput else "N/A"),
-        ("Est. 1M", f"{1_000_000 / throughput / 3600:.2f} hr" if throughput else "N/A"),
-    ):
+    print("\n" + "="*75 + "\nPERFORMANCE\n" + "="*75)
+    for label, value in (("Runtime (sec)", f"{elapsed:.2f}"),
+                         ("Runtime (min)", f"{elapsed/60:.2f}"),
+                         ("Throughput", f"{throughput:.2f} patterns/sec"),
+                         ("Est. 100k", f"{100_000/throughput/60:.2f} min" if throughput else "N/A"),
+                         ("Est. 1M", f"{1_000_000/throughput/3600:.2f} hr" if throughput else "N/A")):
         print(f"{label:<21}: {value}")
-
-    jumps = np.array([r["critical_occupation_jump"] for r in results
-                      if r["transition"] == "first-order"
-                      and r["critical_occupation_jump"] is not None
-                      and np.isfinite(r["critical_occupation_jump"])], dtype=float)
-
-    print("\n" + "=" * 75)
-    print("CRITICAL OCCUPATION JUMP STATISTICS")
-    print("=" * 75)
-    if not len(jumps):
-        print("No valid first-order jump values found.")
+    jumps = np.array([row["critical_occupation_jump"] for row in results
+                      if row["transition"] == "first-order"
+                      and row["critical_occupation_jump"] is not None], dtype=float)
+    print("\n" + "="*75 + "\nCRITICAL OCCUPATION JUMP STATISTICS\n" + "="*75)
+    if jumps.size:
+        for label, val in (("Number of jumps", jumps.size), ("Minimum jump", jumps.min()),
+                           ("Maximum jump", jumps.max()), ("Average jump", jumps.mean()),
+                           ("Median jump", np.median(jumps))):
+            print(f"{label:<21}: {val:.12g}" if isinstance(val, float) or isinstance(val,np.floating)
+                  else f"{label:<21}: {val:,}")
     else:
-        for label, value in (
-            ("Number of jumps", f"{len(jumps):,}"),
-            ("Minimum jump", f"{jumps.min():.12g}"),
-            ("Maximum jump", f"{jumps.max():.12g}"),
-            ("Average jump", f"{jumps.mean():.12g}"),
-            ("Median jump", f"{np.median(jumps):.12g}"),
-        ):
-            print(f"{label:<21}: {value}")
+        print("No resolved first-order jumps.")
 
 
 def main():
     patterns = random_patterns()
     print(f"Searching {len(patterns):,} primitive period-{PERIOD_LENGTH} patterns "
-          f"with degrees {DEGREE_MIN}..{DEGREE_MAX} on {N_JOBS} workers")
+          f"(degrees {DEGREE_MIN}..{DEGREE_MAX}) using {N_JOBS} workers")
+    print(f"Fixed lambda interval: [{LAMBDA_MIN:g}, {LAMBDA_MAX:g}], "
+          f"{SCAN_POINTS} log-spaced samples")
     start = time.perf_counter()
     with parallel_config(backend="loky", inner_max_num_threads=1):
-        results = Parallel(n_jobs=N_JOBS, verbose=10)(
-            delayed(analyze_one)(pattern) for pattern in patterns)
-    elapsed = time.perf_counter() - start
-
+        results = Parallel(n_jobs=N_JOBS, verbose=10)(delayed(analyze_one)(p) for p in patterns)
+    elapsed = time.perf_counter()-start
     print_summary(results, elapsed)
-
-    interesting = [r for r in results if r["transition"] != "second-order"]
-    for row in interesting[:100]:
-        print(row["primitive_pattern"], row["transition"],
-              "lambda=", row["critical_lambda"],
-              "jump=", row["critical_occupation_jump"])
-
     save_csv(OUTPUT_FILE, results)
-    save_csv(INTERESTING_FILE, interesting)
-    print(f"Saved: {OUTPUT_FILE}, {INTERESTING_FILE}")
+    save_csv(INTERESTING_FILE, [r for r in results if r["transition"] != "first-order"])
+    print(f"\nSaved: {OUTPUT_FILE}, {INTERESTING_FILE}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
